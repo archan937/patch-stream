@@ -1,0 +1,14 @@
+[package]
+name = "patch-producer-ts"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No "parallel" feature: wasm32 is single-threaded, parallel would require Send
+rquickjs = { version = "0.9", default-features = false, features = ["futures", "macro"] }
+wit-bindgen = { workspace = true }
+serde_json = { workspace = true }
+futures = { version = "0.3", default-features = false }

@@ -47,7 +47,7 @@ const EDITS: &[&[u8]] = &[
 ];
 
 impl Guest for Component {
-    async fn subscribe() -> StreamReader<u8> {
+    async fn subscribe(_prompt: String) -> StreamReader<u8> {
         let (mut writer, reader) = bindings::wit_stream::new::<u8>();
 
         wit_bindgen::spawn(async move {

@@ -6,6 +6,7 @@ mod bindings {
         async: [
             "import:wasmcloud:patch-stream/patches@0.1.0#subscribe",
             "export:wasi:http/handler@0.3.0-rc-2026-03-15#handle",
+            "import:wasi:http/types@0.3.0-rc-2026-03-15#[static]request.consume-body",
         ],
     });
 }
@@ -17,18 +18,17 @@ use bindings::wasmcloud::patch_stream::patches;
 struct Component;
 
 impl Handler for Component {
-    async fn handle(_request: Request) -> Result<Response, ErrorCode> {
+    async fn handle(request: Request) -> Result<Response, ErrorCode> {
+        // Extract prompt from request body JSON: {"prompt":"..."}
+        let prompt = extract_prompt(request).await.unwrap_or_default();
+
         let headers = Fields::new();
         let _ = headers.append(
             &"content-type".to_string(),
             &b"application/x-ndjson".to_vec(),
         );
 
-        // Both `patches::subscribe` and `wasi:http/handler` use stream<u8>,
-        // so hand the patches stream straight to the response body — no
-        // copy task needed. The `[t+NNNms]` prefix on each line is
-        // baked in by the producer.
-        let patches_rx = patches::subscribe().await;
+        let patches_rx = patches::subscribe(prompt).await;
         let (_trailers_tx, trailers_rx) = bindings::wit_future::new(|| Ok(None));
 
         let (response, _result) = Response::new(headers, Some(patches_rx), trailers_rx);
@@ -37,6 +37,17 @@ impl Handler for Component {
             .map_err(|()| ErrorCode::InternalError(Some("set_status failed".into())))?;
         Ok(response)
     }
+}
+
+async fn extract_prompt(request: Request) -> Option<String> {
+    let (_res_tx, res_rx) =
+        bindings::wit_future::new(|| Ok::<(), ErrorCode>(()));
+    let (body_reader, _trailers) = Request::consume_body(request, res_rx).await;
+
+    let bytes = body_reader.collect().await;
+    let body = String::from_utf8(bytes).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.get("prompt")?.as_str().map(|s| s.to_owned())
 }
 
 bindings::export!(Component with_types_in bindings);

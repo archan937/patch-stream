@@ -23,25 +23,26 @@ interface types {
 interface patches {
     use types.{patch};
 
-    /// Subscribe to the patch stream. Returns NDJSON-encoded bytes
-    /// (`stream<u8>`) rather than a typed `stream<patch>` to dodge a
-    /// wash-runtime gap: wash's dynamic linker can't supply the
-    /// per-stream canonical-ABI builtins (`[stream-read-0]subscribe`,
-    /// `[stream-write-0]subscribe`, etc.) the component model normally
-    /// auto-synthesizes during composition. Using the same payload
-    /// type the consumer already uses for its HTTP body stream
-    /// (`stream<u8>`) keeps the builtins type-compatible. Switch back
-    /// to `stream<patch>` once wash either composes the workload or
-    /// exposes a host-side stream bridge.
+    /// Subscribe to the patch stream for a given prompt. Returns
+    /// NDJSON-encoded bytes (`stream<u8>`) rather than a typed
+    /// `stream<patch>` to dodge a wash-runtime gap (see README).
     ///
     /// Declared `async func` so wit-bindgen lowers via the p3 async
     /// canonical ABI on both sides, matching wash's
     /// `func_new_concurrent` linker bridge.
-    subscribe: async func() -> stream<u8>;
+    subscribe: async func(prompt: string) -> stream<u8>;
 }
 
 world patch-producer {
     import wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15;
+
+    export patches;
+}
+
+world patch-producer-ts {
+    import wasi:http/client@0.3.0-rc-2026-03-15;
+    import wasi:http/types@0.3.0-rc-2026-03-15;
+    import wasi:cli/environment@0.3.0-rc-2026-03-15;
 
     export patches;
 }
