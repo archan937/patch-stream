@@ -1,0 +1,7 @@
+# On macOS arm64, wasi-sdk-24 ships clang binaries that require libLLVM.dylib
+# but omit it from the tarball (packaging bug). Using homebrew LLVM 22 instead,
+# which supports wasm32 targets and works with the wasi-sdk sysroot.
+# Install once with: brew install llvm
+[env]
+CC_wasm32_wasip2 = "/opt/homebrew/opt/llvm/bin/clang"
+AR_wasm32_wasip2 = "/opt/homebrew/opt/llvm/bin/llvm-ar"
