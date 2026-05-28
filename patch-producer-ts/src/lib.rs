@@ -26,25 +26,72 @@ const PAGE_RUNTIME_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/page_runti
 
 // ---------------------------------------------------------------------------
 // HTTP chunk queue — fed by a wasip3 spawn task, drained by __httpStreamRead
+//
+// Design: only ONE HTTP task should be reading a WASI stream at any time.
+// The wasmCloud P3 runtime has a bug where concurrent WASI stream reads crash
+// with "cannot read from stream after being notified that the writable end
+// dropped".  We fix this by making __httpStreamStart async: it cancels the
+// old task and awaits its completion before spawning the new one.
 // ---------------------------------------------------------------------------
 
 struct ChunkQueue {
-    chunks: RefCell<VecDeque<Option<String>>>, // None = end of stream
-    waker: RefCell<Option<Waker>>,
+    chunks:     RefCell<VecDeque<Option<String>>>, // None = end of stream
+    read_waker: RefCell<Option<Waker>>,            // woken when a chunk is pushed
+    done_waker: RefCell<Option<Waker>>,            // woken when the HTTP task exits
+    cancelled:  Cell<bool>,                        // set by __httpStreamStart
+    task_done:  Cell<bool>,                        // set by the HTTP task on exit
 }
 
 impl ChunkQueue {
     fn new() -> Rc<Self> {
         Rc::new(Self {
-            chunks: RefCell::new(VecDeque::new()),
-            waker: RefCell::new(None),
+            chunks:     RefCell::new(VecDeque::new()),
+            read_waker: RefCell::new(None),
+            done_waker: RefCell::new(None),
+            cancelled:  Cell::new(false),
+            task_done:  Cell::new(false),
         })
     }
 
     fn push(&self, chunk: Option<String>) {
         self.chunks.borrow_mut().push_back(chunk);
-        if let Some(w) = self.waker.borrow_mut().take() {
+        if let Some(w) = self.read_waker.borrow_mut().take() {
             w.wake();
+        }
+    }
+
+    /// Called by __httpStreamStart to stop the old HTTP task early.
+    fn cancel(&self) {
+        self.cancelled.set(true);
+        // No need to push None here — the task will stop on its next iteration.
+        // Waking the done_waker isn't needed either; WaitForDone polls task_done.
+    }
+
+    fn is_cancelled(&self) -> bool { self.cancelled.get() }
+
+    /// Called by the HTTP task just before it exits.
+    fn mark_done(&self) {
+        self.task_done.set(true);
+        if let Some(w) = self.done_waker.borrow_mut().take() {
+            w.wake();
+        }
+    }
+}
+
+/// Awaitable: resolves when the HTTP task has exited and dropped its WASI reader.
+struct WaitForDone(Rc<ChunkQueue>);
+
+impl std::future::Future for WaitForDone {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> std::task::Poll<()> {
+        if self.0.task_done.get() {
+            std::task::Poll::Ready(())
+        } else {
+            *self.0.done_waker.borrow_mut() = Some(cx.waker().clone());
+            std::task::Poll::Pending
         }
     }
 }
@@ -60,7 +107,7 @@ impl std::future::Future for NextChunk {
         if let Some(chunk) = self.0.chunks.borrow_mut().pop_front() {
             return std::task::Poll::Ready(chunk);
         }
-        *self.0.waker.borrow_mut() = Some(cx.waker().clone());
+        *self.0.read_waker.borrow_mut() = Some(cx.waker().clone());
         std::task::Poll::Pending
     }
 }
@@ -162,14 +209,19 @@ async fn run_generate(prompt: String, mut writer: StreamWriter<u8>) {
     let active_cq: ActiveCq = Rc::new(RefCell::new(None));
 
     async_with!(ctx => |ctx| {
-        ctx.eval::<(), _>(PAGE_RUNTIME_JS).unwrap_or_else(|_| {
-            let msg = ctx
-                .catch()
-                .as_exception()
-                .and_then(|e| e.message())
-                .unwrap_or_default();
-            panic!("page_runtime eval failed: {msg}");
-        });
+        // Inject globals that must exist BEFORE the bundle evaluates:
+        //
+        // 1. __print  — used by the console polyfill in polyfill.ts
+        // 2. process.env.ANTHROPIC_API_KEY — correct.ts has a module-level
+        //    `new Anthropic()` that reads the key at IIFE init time.  If the key
+        //    is set *after* the eval, that instance gets an empty key and every
+        //    correction call returns 401.
+        ctx.globals().set(
+            "__print",
+            Function::new(ctx.clone(), |msg: String| {
+                eprintln!("[js] {}", msg);
+            }),
+        )?;
 
         let api_key = environment::get_environment()
             .into_iter()
@@ -183,12 +235,53 @@ async fn run_generate(prompt: String, mut writer: StreamWriter<u8>) {
         );
         ctx.eval::<(), _>(setup.as_str()).expect("set ANTHROPIC_API_KEY");
 
-        // __httpStreamStart: sync — creates a ChunkQueue and spawns a wasip3 task
-        // that makes the WASI HTTP request and feeds chunks into the queue.
-        // Running the HTTP send in a proper wasip3 task (not in the rquickjs
-        // executor) ensures wasmtime's async HTTP future is polled by the wasip3
-        // concurrent runtime rather than rquickjs's internal spawner, which would
-        // break the waker chain and cause the request to hang.
+        ctx.eval::<(), _>(PAGE_RUNTIME_JS).unwrap_or_else(|_| {
+            let msg = ctx
+                .catch()
+                .as_exception()
+                .and_then(|e| e.message())
+                .unwrap_or_default();
+            panic!("page_runtime eval failed: {msg}");
+        });
+
+        // __httpStreamAwaitPrev: ASYNC, no args.
+        // Cancels the current HTTP task and awaits its exit so its WASI StreamReader
+        // is dropped before a new one is opened.  Called by fetch() in polyfill.ts
+        // before each __httpStreamStart.  Serialising WASI stream reads avoids a
+        // wasmCloud P3 runtime crash: concurrent reads on two HTTP response bodies
+        // fail with "cannot read from stream after being notified that the writable
+        // end dropped".
+        {
+            let slot = active_cq.clone();
+            ctx.globals().set(
+                "__httpStreamAwaitPrev",
+                Function::new(
+                    ctx.clone(),
+                    Async(MutFn::new({
+                        let slot = slot;
+                        move || {
+                            let slot = slot.clone();
+                            async move {
+                                let old_cq = slot.borrow().clone();
+                                if let Some(old) = old_cq {
+                                    old.cancel();
+                                    WaitForDone(old).await;
+                                    // Clear slot so __httpStreamRead returns None
+                                    // if called before __httpStreamStart sets the new CQ.
+                                    *slot.borrow_mut() = None;
+                                }
+                            }
+                        }
+                    })),
+                ),
+            )?;
+        }
+
+        // __httpStreamStart: SYNC — creates a ChunkQueue and spawns the HTTP task.
+        // Always called immediately after awaiting __httpStreamAwaitPrev.
+        // Running the HTTP send in a wit_bindgen::spawn task ensures the WASI future
+        // is polled by the wasip3 runtime (not by rquickjs), which is required for
+        // the waker chain to work correctly.
         {
             let slot = active_cq.clone();
             ctx.globals().set(
@@ -203,18 +296,28 @@ async fn run_generate(prompt: String, mut writer: StreamWriter<u8>) {
                             match wasi_http_send(&url, &headers_json, &body).await {
                                 Ok(mut reader) => {
                                     loop {
+                                        if cq.is_cancelled() {
+                                            eprintln!("[patch-producer-ts] http_task: cancelled");
+                                            break;
+                                        }
                                         match read_next_chunk(&mut reader).await {
-                                            Some(chunk) => cq.push(Some(chunk)),
+                                            Some(chunk) => {
+                                                if cq.is_cancelled() { break; }
+                                                cq.push(Some(chunk));
+                                            }
                                             None => { cq.push(None); break; }
                                         }
                                     }
-                                    eprintln!("[patch-producer-ts] http_task: response complete");
+                                    eprintln!("[patch-producer-ts] http_task: done");
                                 }
                                 Err(e) => {
                                     eprintln!("[patch-producer-ts] http_task error: {e:?}");
                                     cq.push(None);
                                 }
                             }
+                            // Signal WaitForDone (next __httpStreamAwaitPrev call) that
+                            // this task's WASI StreamReader has been dropped.
+                            cq.mark_done();
                         });
                     },
                 ),
@@ -256,6 +359,9 @@ async fn run_generate(prompt: String, mut writer: StreamWriter<u8>) {
         eprintln!("[patch-producer-ts] generatePage returned promise, awaiting...");
         let result = promise.into_future::<()>().await;
         eprintln!("[patch-producer-ts] generatePage done, ok={}", result.is_ok());
+        if let Err(ref e) = result {
+            eprintln!("[patch-producer-ts] generatePage error: {:?}", e);
+        }
         result.ok();
 
         Ok::<(), rquickjs::Error>(())
